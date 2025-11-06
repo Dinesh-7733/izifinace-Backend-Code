@@ -7,7 +7,7 @@ const path = require("path");
 const Profile = require("../models/Profile");
 const Transaction = require("../models/Transaction")
 const Loan = require("../models/Loan");
-const CustomerProfile = require("../models/BorrowerProfile");
+// const CustomerProfile = require("../models/BorrowerProfile");
 const bucket = require("../config/firebase");
 
 
@@ -226,41 +226,41 @@ exports.getAllCustomers = async (req, res) => {
 
 
 
-exports.getCustomerWithProfile = async (req, res) => {
-  try {
-    const { id } = req.params; // use `id` instead of `customerId`
+// exports.getCustomerWithProfile = async (req, res) => {
+//   try {
+//     const { id } = req.params; // use `id` instead of `customerId`
 
-    // 1. Fetch customer core details
-    const customer = await Borrower.findById(id).lean();
-    if (!customer) {
-      return res.status(404).json({ message: "Customer not found" });
-    }
+//     // 1. Fetch customer core details
+//     const customer = await Borrower.findById(id).lean();
+//     if (!customer) {
+//       return res.status(404).json({ message: "Customer not found" });
+//     }
 
-    // 2. Fetch profile (linked to customer)
-    const profile = await CustomerProfile.findOne({ customer: id }).lean();
+//     // 2. Fetch profile (linked to customer)
+//     const profile = await CustomerProfile.findOne({ customer: id }).lean();
 
-    // 3. Fetch loans
-    const loans = await Loan.find({ borrowerId: id })
-      .sort({ createdAt: -1 })
-      .lean();
+//     // 3. Fetch loans
+//     const loans = await Loan.find({ borrowerId: id })
+//       .sort({ createdAt: -1 })
+//       .lean();
 
-    // 4. Fetch transactions
-    const transactions = await Transaction.find({ borrowerId: id })
-      .sort({ date: -1 })
-      .lean();
+//     // 4. Fetch transactions
+//     const transactions = await Transaction.find({ borrowerId: id })
+//       .sort({ date: -1 })
+//       .lean();
 
-    // 5. Return everything in one response
-    res.status(200).json({
-      customer,
-      profile: profile || null,
-      loans,
-      transactions,
-    });
-  } catch (error) {
-    console.error("Error fetching customer details with profile:", error);
-    res.status(500).json({ message: "Server error", error: error.message });
-  }
-};
+//     // 5. Return everything in one response
+//     res.status(200).json({
+//       customer,
+//       profile: profile || null,
+//       loans,
+//       transactions,
+//     });
+//   } catch (error) {
+//     console.error("Error fetching customer details with profile:", error);
+//     res.status(500).json({ message: "Server error", error: error.message });
+//   }
+// };
 
 // **Get Borrower's Savings Balance**
 exports.getSavings = async (req, res) => {
@@ -285,5 +285,73 @@ exports.getSavings = async (req, res) => {
   } catch (error) {
     console.error("Error fetching savings balance:", error);
     res.status(500).json({ message: "Error fetching savings balance" });
+  }
+};
+
+exports.getBorrowerProfile = async (req, res) => {
+  try {
+    // Borrower is already attached by borrowerProtect middleware
+    const borrower = req.borrower;
+
+    if (!borrower) {
+      return res.status(404).json({ success: false, message: "Borrower not found" });
+    }
+
+    // Fetch loans related to this borrower
+    const loans = await Loan.find({ borrowerId: borrower._id })
+      .populate("lenderId")           // Populate full lender document
+      .populate("requestedByAgentId") // Populate full agent document
+      .populate("issuedByLenderId");  // Populate full issuedBy lender document
+
+    res.status(200).json({
+      success: true,
+      borrower, // Entire borrower object
+      loans     // Array of full loan objects
+    });
+  } catch (error) {
+    console.error("Error fetching borrower profile:", error);
+    res.status(500).json({ success: false, message: "Error fetching borrower profile" });
+  }
+};
+
+
+exports.getCustomersWithoutActiveLoans = async (req, res) => {
+  try {
+    // 1. Find all borrowers who have active loans (these should be EXCLUDED)
+    const activeLoanBorrowerIds = await Loan.find({
+      $or: [
+        { status: "active" },
+        { 
+          status: "pending", 
+          loanRequestStatus: { $in: ["pending", "approved"] } 
+        }
+      ]
+    }).distinct("borrowerId");
+
+    // 2. Find all borrowers who are NOT in the active loans list
+    const customersWithoutActiveLoans = await Borrower.find({
+      _id: { $nin: activeLoanBorrowerIds }
+    });
+
+    // 3. Attach Loan Details to Each Customer (these will only be non-active loans)
+    const customersWithLoanDetails = await Promise.all(
+      customersWithoutActiveLoans.map(async (customer) => {
+        const loanDetails = await Loan.find({ borrowerId: customer._id });
+        return {
+          ...customer.toObject(),
+          loans: loanDetails
+        };
+      })
+    );
+
+    res.status(200).json({
+      success: true,
+      total: customersWithLoanDetails.length,
+      customers: customersWithLoanDetails
+    });
+
+  } catch (error) {
+    console.error("Error fetching customers:", error);
+    res.status(500).json({ message: "Server Error", error });
   }
 };

@@ -42,12 +42,20 @@ function stkPassword(shortcode, passkey, ts) {
 // 🔹 STK Push (Customer to Business - Deposits)
 async function initiateSTKPush(phoneNumber, amount) {
   try {
+    console.log("📞 Original phone number:", phoneNumber);
+
+    // --- Normalize phone number ---
+    // Remove any leading "+" or spaces
+    phoneNumber = phoneNumber.replace(/^\+/, '').replace(/\s+/g, '');
+    console.log("📞 Normalized phone number:", phoneNumber);
+
     amount = Number(amount);
 
-    // Validation
     if (!Number.isFinite(amount) || amount < 1) throw new Error("Amount must be >= 1");
+
     if (process.env.MPESA_ENV === "sandbox" && phoneNumber !== "254708374149")
       throw new Error("Sandbox MSISDN must be 254708374149");
+
     if (process.env.MPESA_ENV !== "sandbox" && !/^2547\d{8}$/.test(phoneNumber))
       throw new Error("Phone must be 2547XXXXXXXX");
 
@@ -66,7 +74,7 @@ async function initiateSTKPush(phoneNumber, amount) {
         PartyA: phoneNumber,
         PartyB: process.env.MPESA_SHORTCODE,
         PhoneNumber: phoneNumber,
-        CallBackURL: process.env.MPESA_STK_CALLBACK_URL || "https://your-ngrok-url.ngrok-free.app/mpesa/callback",
+        CallBackURL: process.env.MPESA_STK_CALLBACK_URL,
         AccountReference: process.env.MPESA_ENV === "sandbox" ? "TEST-STK" : "IziBank",
         TransactionDesc: process.env.MPESA_ENV === "sandbox" ? "TEST MODE — NO REAL DEBIT" : "Deposit to Wallet",
       },
@@ -75,10 +83,12 @@ async function initiateSTKPush(phoneNumber, amount) {
 
     return data;
   } catch (error) {
-    console.error("❌ STK Push failed:", error.response?.data || error.message);
-    throw new Error("STK Push initiation failed");
+    console.error("❌ STK Push failed - full error:", error.response?.data || error.message);
+    throw new Error(error.response?.data?.errorMessage || error.message || "STK Push initiation failed");
   }
 }
+
+
 
 // 🔹 STK Query (Check transaction status)
 async function querySTK(checkoutRequestID) {
@@ -105,13 +115,36 @@ async function querySTK(checkoutRequestID) {
   }
 }
 
+function formatPhoneNumber(phoneNumber) {
+  // Remove spaces and leading '+'
+  phoneNumber = phoneNumber.trim();
+
+  if (phoneNumber.startsWith('+')) {
+    phoneNumber = phoneNumber.substring(1);
+  }
+
+  // If phone starts with 07..., convert to 2547...
+  if (phoneNumber.startsWith('07')) {
+    phoneNumber = '254' + phoneNumber.substring(1);
+  }
+
+  // If phone starts with 7..., add 254 prefix
+  if (phoneNumber.startsWith('7')) {
+    phoneNumber = '254' + phoneNumber;
+  }
+
+  return phoneNumber;
+}
+
 // 🔹 B2C Payment (Business to Customer - Loan disbursement / withdrawals)
 async function initiateB2C(phoneNumber, amount) {
   try {
     console.log("B2C Initiation Started");
-    console.log("PhoneNumber (PartyB):", phoneNumber);
-    console.log("Amount:", amount);
-    
+
+    // ✅ Format phone before sending
+    const sanitizedPhone = formatPhoneNumber(phoneNumber);
+    console.log("Sanitized PhoneNumber (PartyB):", sanitizedPhone);
+
     const accessToken = await getAccessToken();
     console.log("Access token obtained:", accessToken);
 
@@ -123,7 +156,7 @@ async function initiateB2C(phoneNumber, amount) {
         CommandID: "BusinessPayment",
         Amount: amount,
         PartyA: process.env.MPESA_B2C_SHORTCODE,
-        PartyB: phoneNumber,
+        PartyB: sanitizedPhone, // ✅ Send cleaned phone number
         Remarks: "Loan Disbursement",
         QueueTimeOutURL: process.env.MPESA_B2C_TIMEOUT_URL,
         ResultURL: process.env.MPESA_B2C_RESULT_URL,

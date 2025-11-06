@@ -25,10 +25,17 @@ cron.schedule("0 6,18 * * *", async () => {
       const now = new Date();
 
       // 🔹 Step 1: Mark overdue if dueDate has passed
-      if (loan.dueDate < now && loan.status === "active" && loan.balance > 0) {
+   // 🔹 IMPROVED: Create Nairobi time for accurate comparison
+      const nairobiTime = new Date(now.toLocaleString("en-US", { timeZone: "Africa/Nairobi" }));
+      const dueDate = new Date(loan.dueDate);
+
+      // 🔹 Step 1: Mark overdue if dueDate has passed (in Nairobi time)
+      if (dueDate < nairobiTime && loan.status === "active" && loan.balance > 0) {
         loan.status = "overdue";
+        loan.updatedAt = now;
         await loan.save();
-        console.log(`⚠️ Loan ID: ${loan._id} marked as OVERDUE`);
+        
+        console.log(`⚠️ Loan ID: ${loan._id} marked as OVERDUE | Due: ${dueDate} | Now: ${nairobiTime}`);
       }
 
       // 🔹 Step 2: Send reminder SMS

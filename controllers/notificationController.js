@@ -23,7 +23,7 @@ exports.getBorrowerNotifications = async (req, res) => {
     const borrowerId = req.borrower._id; // borrowerProtect middleware sets this
 
     const notifications = await Notification.find({
-      borrowerId,
+      userId:borrowerId,
       isDeleted: false,
     }).sort({ createdAt: -1 }); // latest first
 
@@ -45,19 +45,22 @@ exports.getBorrowerNotifications = async (req, res) => {
 exports.markBorrowerNotificationAsRead = async (req, res) => {
   try {
     const borrowerId = req.borrower._id;
-    const { id } = req.params; // notification ID
 
-    const notification = await Notification.findOneAndUpdate(
-      { _id: id, borrowerId, isDeleted: false },
-      { $set: { isRead: true } },
-      { new: true }
+    const result = await Notification.updateMany(
+      {
+        userId: borrowerId,
+        userModel: "Customer",
+        isDeleted: false,
+        isRead: false,
+      },
+      { $set: { isRead: true } }
     );
 
-    if (!notification) {
-      return res.status(404).json({ success: false, message: "Notification not found" });
-    }
-
-    res.status(200).json({ success: true, data: notification });
+    res.status(200).json({
+      success: true,
+      message: "All notifications marked as read",
+      modifiedCount: result.modifiedCount,
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -68,11 +71,11 @@ exports.deleteBorrowerNotification = async (req, res) => {
     const borrowerId = req.borrower._id;
     const { id } = req.params; // notification ID
 
-    const notification = await Notification.findOneAndUpdate(
-      { _id: id, borrowerId, isDeleted: false },
-      { $set: { isDeleted: true, deletedAt: new Date() } },
-      { new: true }
-    );
+const notification = await Notification.upd(
+  { _id: id, userId: borrowerId, userModel: "Customer", isDeleted: false },
+  { $set: { isDeleted: true, deletedAt: new Date() } },
+  { new: true }
+);
 
     if (!notification) {
       return res.status(404).json({ success: false, message: "Notification not found" });

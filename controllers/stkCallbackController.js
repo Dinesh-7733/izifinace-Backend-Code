@@ -5,31 +5,35 @@ const Borrower = require ("../models/customer");
 const Notification = require("../models/Notification");
 const mongoose = require("mongoose");
 const { reverseTransaction } = require("../utils/mpesa");
+const { sendSMS } = require("../utils/sms");
 // Single callback for all STK Push transactions
 
 
+// ✅ STK Callback Controller
 exports.stkCallback = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
 
   try {
     const callbackData = req.body;
-    console.log("STK Callback Received:", JSON.stringify(callbackData, null, 2));
+    console.log("📥 STK Callback Received:", JSON.stringify(callbackData, null, 2));
 
     const { CheckoutRequestID, ResultCode, ResultDesc, CallbackMetadata } =
-      callbackData.Body.stkCallback;
+      callbackData?.Body?.stkCallback || {};
 
-    // Extract Amount & MpesaReceiptNumber
+    if (!CheckoutRequestID) throw new Error("CheckoutRequestID missing in callback");
+
+    // ✅ Extract Amount & MpesaReceiptNumber
     let Amount = 0;
     let MpesaReceiptNumber = "";
-    if (CallbackMetadata && CallbackMetadata.Item) {
-      CallbackMetadata.Item.forEach((item) => {
+    if (CallbackMetadata?.Item) {
+      CallbackMetadata.Item.forEach(item => {
         if (item.Name === "Amount") Amount = item.Value;
         if (item.Name === "MpesaReceiptNumber") MpesaReceiptNumber = item.Value;
       });
     }
 
-    // 1️⃣ Find the transaction
+    // ✅ 1. Find the transaction
     const transaction = await Transaction.findOne({ checkoutRequestID: CheckoutRequestID }).session(session);
     if (!transaction) {
       await session.abortTransaction();
@@ -37,70 +41,98 @@ exports.stkCallback = async (req, res) => {
       return res.status(404).json({ message: "Transaction not found" });
     }
 
-    // ⚠️ Duplicate callback protection
+    // ✅ Prevent duplicate callback
     if (transaction.status === "successful") {
-      console.log("⚠️ Duplicate callback ignored for transaction:", transaction._id);
       await session.commitTransaction();
       session.endSession();
       return res.status(200).json({ message: "Duplicate callback ignored" });
     }
 
-    // Check for invalid borrower (wrong ID / typo)
-    let borrower = null;
-    if (transaction.type === "repayment") {
-      borrower = await Borrower.findById(transaction.userId).session(session);
-      if (!borrower) {
-        console.log("Invalid borrower detected, triggering reversal...");
-        await reverseTransaction(CheckoutRequestID, Amount, transaction.sender);
-        transaction.status = "reversed";
-        await transaction.save({ session });
-        await session.commitTransaction();
-        session.endSession();
-        return res.status(200).json({ message: "Reversal triggered due to invalid borrower" });
-      }
+    // ✅ 2. Find user dynamically (Customer or User)
+    const UserModel = transaction.userModel === "User" ? User : Borrower;
+    console.log("UserModel resolved as:", UserModel.modelName);
+
+    let user = await UserModel.findById(transaction.userId).session(session);
+
+    // ❌ If repayment & user not found → Reverse
+    if (transaction.type === "repayment" && !user) {
+      await reverseTransaction(CheckoutRequestID, Amount, transaction.phone);
+      transaction.status = "reversed";
+      await transaction.save({ session });
+      await session.commitTransaction();
+      session.endSession();
+      return res.status(200).json({ message: "Reversal triggered due to invalid borrower" });
     }
 
-    // Update transaction status & receipt
+    // ✅ Set status & transactionId
     transaction.status = ResultCode === 0 ? "successful" : "failed";
     transaction.transactionId = MpesaReceiptNumber || transaction.transactionId;
 
-    // Post-commit async tasks
+    // ✅ Post-commit tasks (SMS / Notification)
     const postCommitTasks = [];
 
-    // 2️⃣ Handle transaction types
-    if (transaction.type === "savings") {
-      const user = await User.findById(transaction.userId).session(session);
+    /* ------------------ 💰 Case 1: Wallet Deposit (User Savings) ------------------ */
+    if (transaction.type === "savings" && user) {
+      transaction.balanceBefore = user.walletBalance;
 
-      if (user && transaction.status === "successful") {
+      if (transaction.status === "successful") {
         user.walletBalance += Number(Amount);
+        transaction.balanceAfter = user.walletBalance;
         await user.save({ session });
 
-        transaction.balanceAfter = user.walletBalance;
-
         postCommitTasks.push(async () => {
-          await sendSMS(
-            user.phone,
-            `✅ Dear ${user.fullName || "User"}, your deposit of KES ${Amount} was successful. 
-Your new wallet balance is KES ${user.walletBalance}.`
+          await sendSMS(user.phone,
+            `✅ Dear ${user.fullName || "User"}, your deposit of KES ${Amount} was successful. Wallet balance: KES ${user.walletBalance}.`
           );
           await Notification.create({
             userId: user._id,
-            userModel: "User",
+            userModel: transaction.userModel,
             title: "Deposit Successful",
             message: `Deposit of KES ${Amount} received. Wallet balance: KES ${user.walletBalance}.`,
             type: "deposit",
           });
         });
       } else {
-        transaction.balanceAfter = user ? user.walletBalance : 0;
+        transaction.balanceAfter = transaction.balanceBefore;
       }
-    } else if (transaction.type === "repayment") {
+    }
+
+    /* ------------------ 💵 Case 2: Customer Deposit (Savings Balance) --------------- */
+    else if (transaction.type === "customer deposit" && user) {
+      transaction.balanceBefore = user.savingsBalance;
+
+      if (transaction.status === "successful") {
+        user.savingsBalance += Number(Amount);
+        transaction.balanceAfter = user.savingsBalance;
+        await user.save({ session });
+
+        postCommitTasks.push(async () => {
+          await sendSMS(
+            user.phone,
+            `✅ Dear ${user.fullName}, deposit of KES ${Amount} successful. Savings balance: KES ${user.savingsBalance}.`
+          );
+          await Notification.create({
+            userId: user._id,
+            userModel: "Customer",
+            title: "Deposit Successful",
+            message: `KES ${Amount} added to savings. New balance: KES ${user.savingsBalance}.`,
+            type: "deposit",
+          });
+        });
+      } else {
+        transaction.balanceAfter = transaction.balanceBefore;
+      }
+    }
+
+    /* ------------------ 📉 Case 3: Loan Repayment ------------------ */
+    else if (transaction.type === "repayment") {
       const loan = await Loan.findById(transaction.loanId).session(session);
 
-      if (loan && borrower && transaction.status === "successful") {
+      if (loan && user && transaction.status === "successful") {
+        transaction.balanceBefore = loan.balance;
+
         loan.repaidAmount += Number(Amount);
         loan.balance -= Number(Amount);
-
         if (loan.balance <= 0) {
           loan.balance = 0;
           loan.status = "fully paid";
@@ -111,59 +143,46 @@ Your new wallet balance is KES ${user.walletBalance}.`
           transactionId: transaction.transactionId,
           date: new Date(),
         });
+
         await loan.save({ session });
 
-        borrower.loanBalance = loan.balance;
-        await borrower.save({ session });
-
+        user.loanBalance = loan.balance;
         transaction.balanceAfter = loan.balance;
+        await user.save({ session });
 
         postCommitTasks.push(async () => {
           await sendSMS(
-            borrower.phone,
-            `✅ Dear ${borrower.fullName}, repayment of KES ${Amount} received. Remaining loan balance: KES ${loan.balance}.`
+            user.phone,
+            `✅ Dear ${user.fullName}, repayment of KES ${Amount} received. Remaining loan balance: KES ${loan.balance}.`
           );
           await Notification.create({
             userId: loan.lenderId,
             userModel: "User",
             title: "Loan Repayment Received",
-            message: `Borrower ${borrower.fullName} repaid KES ${Amount}. Remaining balance: KES ${loan.balance}.`,
+            message: `Borrower ${user.fullName} repaid KES ${Amount}. Balance: ${loan.balance}.`,
             type: "repayment",
           });
         });
-      } else {
-        transaction.balanceAfter = loan ? loan.balance : 0;
       }
     }
 
-    // 3️⃣ Save transaction updates
+    // ✅ 3. Save transaction
     await transaction.save({ session });
 
-    // ✅ Commit transaction
+    // ✅ 4. Commit transaction
     await session.commitTransaction();
     session.endSession();
 
-    // 4️⃣ Execute post-commit tasks
-    for (const task of postCommitTasks) {
-      try {
-        await task();
-      } catch (err) {
-        console.error("⚠️ Post-commit task failed:", err);
-      }
-    }
+    // ✅ 5. Execute SMS & notifications AFTER DB commit
+    await Promise.all(postCommitTasks.map(fn => fn()));
 
-    res.status(200).json({ message: "STK callback processed", transaction });
+    return res.status(200).json({ message: "STK Callback processed", transaction });
+
   } catch (error) {
-    try {
-      if (session.inTransaction()) {
-        await session.abortTransaction();
-      }
-    } catch (_) {}
-    finally {
-      session.endSession();
-    }
+    if (session.inTransaction()) await session.abortTransaction();
+    session.endSession();
     console.error("❌ STK callback error:", error);
-    res.status(500).json({ message: "Error processing STK callback", error: error.message });
+    return res.status(500).json({ message: "Error processing callback", error: error.message });
   }
 };
 

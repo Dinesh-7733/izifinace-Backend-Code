@@ -1,6 +1,7 @@
 const User = require("../models/User");
 const Transaction = require("../models/Transaction");
 const { initiateSTKPush, initiateB2C } = require("../utils/mpesa");
+const Borrower = require("../models/customer")
 
 const mongoose = require("mongoose");
 const { sendSMS } = require("../utils/sms");
@@ -48,17 +49,17 @@ exports.deposit = async (req, res) => {
     if (!user) return res.status(404).json({ message: "User not found" });
     if (!user.isPhoneVerified) return res.status(403).json({ message: "Phone number not verified" });
 
-    const phoneNumber = process.env.MPESA_ENV === "sandbox"
-      ? "254708374149"
-      : user.phone;
+
+
 
     // --- Create transaction as pending ---
     const depositTransaction = new Transaction({
       userId,
+      userModel: "User",
       type: "savings",
       amount: Number(amount),
       status: "pending",
-      phone: phoneNumber
+      phone: user.phone
     });
 
     await depositTransaction.save();
@@ -82,6 +83,8 @@ exports.deposit = async (req, res) => {
     message: `You deposited KES ${amount} into your wallet successfully.`,
     type: "deposit"
   });
+  // ✅ SMS (send in both modes)
+      await sendSMS(user.phone, `✅ Deposit Successful: KES ${amount} added to your wallet.`);
 
       stkResponse = {
         MerchantRequestID: depositTransaction.checkoutRequestID,
@@ -96,12 +99,16 @@ exports.deposit = async (req, res) => {
         stkResponse
       });
     }
-
+  const phoneNumber = user.phone;
     // --- Live Mode: initiate real STK Push ---
     stkResponse = await initiateSTKPush(phoneNumber, amount);
 
-    depositTransaction.checkoutRequestID = stkResponse.CheckoutRequestID;
-    await depositTransaction.save();
+  // Save checkoutRequestID before sending response
+depositTransaction.checkoutRequestID = stkResponse.CheckoutRequestID;
+await depositTransaction.save();
+ 
+//  // ✅ Send SMS notification immediately (after initiating)
+//     await sendSMS(phoneNumber, `📲 Deposit of KES ${amount} initiated. Awaiting MPESA confirmation.`);   
 
     res.status(200).json({
       message: "Deposit initiated successfully",
@@ -155,6 +162,7 @@ exports.withdraw = async (req, res) => {
       [{
         userId,
         type: "withdrawal",
+         userModel: "User",
         amount: Number(amount),
         status: "pending",
         phone: user.phone,
@@ -192,8 +200,9 @@ exports.withdraw = async (req, res) => {
       });
     }
 
+const normalizedPhone = user.phone
     // --- LIVE ENVIRONMENT ---
-    const b2cResponse = await initiateB2C(user.phone, amount);
+    const b2cResponse = await initiateB2C(normalizedPhone, amount);
 
     transaction.checkoutRequestID = b2cResponse.OriginatorConversationID || null;
     await transaction.save({ session });
@@ -221,4 +230,201 @@ exports.withdraw = async (req, res) => {
     res.status(500).json({ message: "Error processing withdrawal", error: error.message });
   }
 };
+
+
+exports.depositSavings = async (req, res) => {
+  try {
+    const { amount } = req.body;
+    const borrower = req.borrower; // Use borrower from middleware
+
+    if (!borrower || !borrower._id) {
+      return res.status(401).json({ message: "Unauthorized or borrower not found" });
+    }
+
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ message: "Invalid amount" });
+    }
+
+       // ✅ Use the borrower’s real phone number & convert to international format (254...)
+    let phoneNumber = borrower.phone;
+    if (!phoneNumber) {
+      return res.status(400).json({ message: "Phone number not found for this borrower" });
+    }
+
+    // --- Create transaction as pending ---
+      // 1️⃣ Create pending transaction
+    const transaction = new Transaction({
+      userId: borrower._id,
+      userModel: "Customer",
+      type: "customer deposit",
+      amount: Number(amount),
+      status: "pending",
+      phone: phoneNumber,
+      balanceBefore: borrower.savingsBalance,
+      balanceAfter: borrower.savingsBalance
+    });
+
+    await transaction.save();
+
+    // --- Sandbox Mode: directly credit savings ---
+    if (process.env.MPESA_ENV === "sandbox") {
+      borrower.savingsBalance += Number(amount);
+      await borrower.save();
+
+      transaction.status = "successful";
+      transaction.transactionId = `TEST-${Date.now()}`;
+      await transaction.save();
+
+      // Notification
+      await Notification.create({
+        userId: borrower._id,
+        userModel: "Customer",
+        title: "Deposit Successful",
+        message: `KES ${amount} deposited into your savings successfully.`,
+        type: "deposit"
+      });
+
+      
+      // ✅ SMS (always send)
+      await sendSMS(
+        phoneNumber,
+        `✅ Deposit Successful: KES ${amount} added to your savings. New balance: KES ${borrower.savingsBalance}.`
+      ).catch(console.error)
+      
+      return res.status(200).json({
+        message: "Deposit completed successfully (sandbox)",
+        savingsBalance: borrower.savingsBalance,
+        transaction
+      });
+    }
+
+    // --- Live Mode: STK Push ---
+    const stkResponse = await initiateSTKPush(phoneNumber, amount);
+
+    transaction.checkoutRequestID = stkResponse.CheckoutRequestID;
+    await transaction.save();
+
+    res.status(200).json({
+      message: "Deposit initiated, complete the payment on your phone.",
+      stkResponse,
+      transaction
+    });
+
+  } catch (error) {
+    console.error("Error in depositSavings:", error);
+    res.status(500).json({ message: error.message });
+  }
+};
+
+exports.withdrawCustomerSavings = async (req, res) => {
+  const session = await mongoose.startSession();
+
+  try {
+    session.startTransaction();
+
+    const borrower = req.borrower;
+    const { amount } = req.body;
+
+    if (!borrower || !borrower._id) throw new Error("Unauthorized or borrower not found");
+    if (!amount || amount <= 0) throw new Error("Valid amount is required");
+
+    const customer = await Borrower.findById(borrower._id).session(session);
+    if (!customer) throw new Error("Customer not found");
+    if (customer.savingsBalance < Number(amount)) throw new Error("Insufficient savings balance");
+
+    // Create Withdrawal Transaction
+// 1️⃣ Create pending transaction
+    const [transaction] = await Transaction.create(
+      [{
+        userId: customer._id,
+        userModel: "Customer",
+        type: "customer withdrawal",
+        amount: Number(amount),
+        status: "pending",
+        phone: customer.phone,
+        balanceBefore: customer.savingsBalance,
+        balanceAfter: customer.savingsBalance
+      }],
+      { session }
+    );
+
+    // --- SANDBOX MODE ---
+    if (process.env.MPESA_ENV === "sandbox") {
+      customer.savingsBalance -= Number(amount);
+      transaction.balanceAfter = customer.savingsBalance;
+      transaction.status = "successful";
+
+      // ✅ Notifications inside transaction
+      await Notification.create(
+        [{
+          userId: customer._id,
+          userModel: "Customer",
+          title: "Savings Withdrawal Successful",
+          message: `You have withdrawn KES ${amount} from your savings.`,
+          type: "withdraw", // MUST match enum
+        }],
+        { session }
+      );
+
+      await customer.save({ session });
+      await transaction.save({ session });
+
+      await session.commitTransaction();
+      session.endSession();
+
+      // SMS outside transaction (won't affect rollback)
+      sendSMS(
+        customer.phone,
+        `✅ You have withdrawn KES ${amount} from your savings. New balance: KES ${customer.savingsBalance}.`
+      ).catch(console.error);
+
+      return res.status(200).json({
+        message: "Withdrawal successful (sandbox)",
+        transaction
+      });
+    }
+const phoneNumber =  borrower.phone;
+    // --- LIVE MODE: B2C ---
+    const b2cResponse = await initiateB2C(phoneNumber, amount);
+    transaction.checkoutRequestID = b2cResponse.OriginatorConversationID || null;
+
+    // Notifications inside transaction
+    await Notification.create(
+      [{
+        userId: customer._id,
+        userModel: "Customer",
+        title: "Savings Withdrawal Initiated",
+        message: `KES ${amount} withdrawal initiated. Await confirmation from M-Pesa.`,
+        type: "withdraw", // MUST match enum
+      }],
+      { session }
+    );
+
+    await transaction.save({ session });
+    await session.commitTransaction();
+    session.endSession();
+
+    // SMS outside transaction
+    sendSMS(
+      customer.phone,
+      `✅ KES ${amount} withdrawal initiated. Please check M-Pesa for confirmation.`
+    ).catch(console.error);
+
+    return res.status(200).json({
+      message: "Withdrawal request sent to M-Pesa. Awaiting confirmation.",
+      transaction,
+      b2cResponse
+    });
+
+  } catch (error) {
+    if (session.inTransaction()) await session.abortTransaction();
+    session.endSession();
+    console.error("❌ Customer Withdrawal Error:", error);
+    return res.status(500).json({
+      message: "Error processing savings withdrawal",
+      error: error.message
+    });
+  }
+};
+
 

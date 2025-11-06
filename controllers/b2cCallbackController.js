@@ -4,13 +4,13 @@ const Borrower = require("../models/customer");
 const Loan = require("../models/Loan");
 const Notification = require("../models/Notification");
 const mongoose = require("mongoose");
+const { sendSMS } = require("../utils/sms");
 
 
 exports.b2cCallback = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
 
-  // Collect async tasks (run after commit)
   const postCommitTasks = [];
 
   try {
@@ -26,9 +26,7 @@ exports.b2cCallback = async (req, res) => {
 
     const { ResultCode, ResultDesc, OriginatorConversationID, TransactionID } = Result;
     console.log("👉 ResultCode:", ResultCode, "(", ResultDesc, ")");
-    console.log("👉 TransactionID:", TransactionID);
 
-    // Find transaction by OriginatorConversationID
     const transaction = await Transaction.findOne({
       checkoutRequestID: OriginatorConversationID,
     }).session(session);
@@ -39,40 +37,83 @@ exports.b2cCallback = async (req, res) => {
       return res.status(404).json({ message: "Transaction not found" });
     }
 
+    // Idempotency check
+    if (transaction.status === "successful") {
+      await session.endSession();
+      return res.status(200).json({ message: "Transaction already processed" });
+    }
+
     // Handle failed transaction
     if (ResultCode !== 0) {
-      await Transaction.deleteOne({ _id: transaction._id }).session(session);
+      transaction.status = "failed";
+      transaction.mpesaPayload = Result;
+      await transaction.save({ session });
 
-      const loan = await Loan.findOne({
-        borrowerId: transaction.borrowerId,
-        amount: transaction.amount,
-        status: "pending",
-      }).session(session);
+      if (transaction.type === "loan issued") {
+        const loan = await Loan.findOne({
+          borrowerId: transaction.userId,
+          amount: transaction.amount,
+          status: "pending",
+        }).session(session);
+        if (loan) {
+          loan.status = "failed";
+          await loan.save({ session });
+          console.log(`❌ Loan of ${loan.amount} marked as failed`);
+        }
+      }
 
-      if (loan) {
-        await Loan.deleteOne({ _id: loan._id }).session(session);
-        console.log(`❌ Loan of ${loan.amount} deleted due to transaction failure`);
+      if (transaction.type === "customer withdrawal") {
+        const customer = await Borrower.findById(transaction.userId).session(session);
+        if (customer) {
+          customer.savingsBalance += transaction.amount; // refund
+          await customer.save({ session });
+          console.log(`❌ Customer withdrawal of ${transaction.amount} rolled back`);
+        }
       }
 
       await session.commitTransaction();
       session.endSession();
-
-      return res.status(200).json({ message: "Transaction failed, created data removed" });
+      return res.status(200).json({ message: "Transaction failed, data updated" });
     }
 
     // Successful transaction
     transaction.status = "successful";
     transaction.transactionId = TransactionID || OriginatorConversationID;
-    await transaction.save({ session });
+    transaction.mpesaPayload = Result;
 
-    // Withdrawals
+    // --- Customer Withdrawal ---
+    if (transaction.type === "customer withdrawal") {
+      const customer = await Borrower.findById(transaction.userId).session(session);
+      if (customer) {
+        customer.savingsBalance -= transaction.amount;
+        transaction.balanceAfter = customer.savingsBalance;
+
+        await customer.save({ session });
+        await transaction.save({ session });
+
+        postCommitTasks.push(async () => {
+          await Notification.create({
+            userId: customer._id,
+            userModel: "Customer",
+            title: "Withdrawal Successful",
+            message: `KES ${transaction.amount} withdrawn from your savings successfully.`,
+            type: "withdraw",
+          });
+          await sendSMS(
+            customer.phone,
+            `✅ KES ${transaction.amount} withdrawn from your savings. New balance: KES ${customer.savingsBalance}.`
+          );
+        });
+      }
+    }
+
+    // --- User Wallet Withdrawal ---
     if (transaction.type === "withdrawal") {
       const user = await User.findById(transaction.userId).session(session);
       if (user) {
         user.walletBalance -= transaction.amount;
         await user.save({ session });
 
-        // Run after commit
         postCommitTasks.push(async () => {
           await Notification.create({
             userId: user._id,
@@ -81,20 +122,17 @@ exports.b2cCallback = async (req, res) => {
             message: `KES ${transaction.amount} withdrawn from your wallet.`,
             type: "withdraw",
           });
-          await sendSMS(user.phone, `✅ KES ${transaction.amount} has been withdrawn from your wallet.`);
+          await sendSMS(user.phone, `✅ KES ${transaction.amount} withdrawn from your wallet.`);
         });
       }
     }
 
-    // Loan issuance
-    else if (transaction.type === "loan issued") {
-      const borrower = await Borrower.findById(transaction.borrowerId).session(session);
+    // --- Loan Issuance ---
+    if (transaction.type === "loan issued") {
+      const borrower = await Borrower.findById(transaction.userId).session(session);
       if (borrower) {
-        borrower.savingsBalance = (borrower.savingsBalance || 0) + transaction.amount;
-        await borrower.save({ session });
-
         const loan = await Loan.findOne({
-          borrowerId: transaction.borrowerId,
+          borrowerId: borrower._id,
           amount: transaction.amount,
           status: "pending",
         }).sort({ createdAt: -1 }).session(session);
@@ -105,17 +143,13 @@ exports.b2cCallback = async (req, res) => {
           await loan.save({ session });
 
           postCommitTasks.push(async () => {
-
-              // ✅ Borrower Notification
-        await Notification.create({
-          userId: borrower._id,
-          userModel: "Customer", // 👈 matches your refPath
-          title: "Loan Issued",
-          message: `✅ Hello ${borrower.fullName}, your loan of KES ${loan.amount} has been issued. Total repayment: KES ${loan.totalRepayment}. Due date: ${loan.dueDate.toDateString()}`,
-          type: "loan",
-        });
-
-        
+            await Notification.create({
+              userId: borrower._id,
+              userModel: "Customer",
+              title: "Loan Issued",
+              message: `✅ Hello ${borrower.fullName}, your loan of KES ${loan.amount} has been issued. Total repayment: KES ${loan.totalRepayment}. Due date: ${loan.dueDate.toDateString()}`,
+              type: "loan",
+            });
             await sendSMS(
               borrower.phone,
               `✅ Hello ${borrower.fullName}, your loan of KES ${loan.amount} is now active. Total repayment: KES ${loan.totalRepayment}, due date: ${loan.dueDate.toDateString()}`
@@ -139,20 +173,19 @@ exports.b2cCallback = async (req, res) => {
     await session.commitTransaction();
     session.endSession();
 
-    // 🔹 Run post-commit tasks
-    for (const task of postCommitTasks) {
-      try {
-        await task();
-      } catch (err) {
-        console.error("⚠️ Post-commit task failed:", err);
-      }
-    }
+    // Execute post-commit tasks in parallel
+    await Promise.all(postCommitTasks.map(task => task().catch(console.error)));
 
     return res.status(200).json({ message: "B2C callback processed successfully" });
 
   } catch (error) {
-    await session.abortTransaction();
-    session.endSession();
+    try {
+      if (session.inTransaction()) await session.abortTransaction();
+    } catch (_) {}
+    finally {
+      session.endSession();
+    }
+
     console.error("🔥 B2C Callback Error:", error);
     return res.status(500).json({ message: "Server error in B2C callback", error: error.message });
   }

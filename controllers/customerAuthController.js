@@ -45,29 +45,61 @@ exports.loginRequest = async (req, res) => {
 exports.loginVerify = async (req, res) => {
   try {
     const { phone, otp } = req.body;
+
+    // Step 1: Validate input
     if (!phone || !otp) {
       return res.status(400).json({ success: false, message: "Phone and OTP are required" });
     }
 
+    console.log("Step 1: Received phone & OTP", phone, otp);
+
+    // Step 2: Normalize phone
     const normalizedPhone = normalizeToE164(phone, "KE");
-    if (!normalizedPhone) return res.status(400).json({ success: false, message: "Invalid phone number" });
+    if (!normalizedPhone) {
+      return res.status(400).json({ success: false, message: "Invalid phone number" });
+    }
+    console.log("Step 2: Normalized phone", normalizedPhone);
 
-    // Verify OTP
-    const result = await verifyOTP(normalizedPhone, otp);
-    if (!result.success) return res.status(400).json(result);
+    // Step 3: Verify OTP
+    let otpResult;
+    try {
+      otpResult = await verifyOTP(normalizedPhone, otp);
+    } catch (err) {
+      console.error("OTP verification error:", err);
+      return res.status(400).json({ success: false, message: err.message || "OTP verification failed" });
+    }
 
-    // Get customer
+    if (!otpResult.success) {
+      return res.status(400).json(otpResult);
+    }
+    console.log("Step 3: OTP verified", otpResult);
+
+    // Step 4: Find customer
     const customer = await Customer.findOne({ phone: normalizedPhone });
-    if (!customer) return res.status(404).json({ success: false, message: "Borrower not registered" });
+    if (!customer) {
+      return res.status(404).json({ success: false, message: "Borrower not registered" });
+    }
+    console.log("Step 4: Customer found", customer._id);
 
-    // Generate tokens
+    // Step 5: Generate access token
     const accessToken = signAccess({ sub: customer._id, role: "borrower" });
-    const { refreshToken } = await issueSession(customer._id, {
-      ua: req.headers["user-agent"],
-      ip: req.ip,
-    });
+    console.log("Step 5: Access token generated");
 
-    res.json({
+    // Step 6: Issue refresh token (no artificial timeout)
+    let sessionResult;
+    try {
+      sessionResult = await issueSession(customer._id, {
+        ua: req.headers["user-agent"],
+        ip: req.ip,
+      });
+    } catch (err) {
+      console.error("Session creation error:", err);
+      return res.status(500).json({ success: false, message: "Failed to create session" });
+    }
+    console.log("Step 6: Refresh token issued");
+
+    // Step 7: Respond with tokens and customer info
+    return res.json({
       success: true,
       message: "Login successful",
       customer: {
@@ -76,10 +108,13 @@ exports.loginVerify = async (req, res) => {
         phone: customer.phone,
         isVerified: customer.isVerified,
       },
-      tokens: { accessToken, refreshToken },
+      tokens: {
+        accessToken,
+        refreshToken: sessionResult.refreshToken,
+      },
     });
   } catch (err) {
     console.error("loginVerify error:", err);
-    res.status(500).json({ success: false, message: "Server error" });
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 };

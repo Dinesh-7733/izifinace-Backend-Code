@@ -269,4 +269,19 @@ const registerCustomer = async (req, res) => {
   }
 };
 
-module.exports = { registerAgent ,changePassword,loginAgent , registerCustomer};
+
+
+const getAgentProfile = asyncHandler(async (req, res) => {
+  // req.user is set by your 'protect' middleware
+  const agent = await AgentModel.findById(req.user._id)
+    .select("-password") // exclude password
+    .populate("customers"); // populate all customer fields if needed
+
+  if (!agent) {
+    return res.status(404).json({ message: "Agent not found" });
+  }
+
+  res.status(200).json(agent); // return the whole agent object
+});
+
+module.exports = { registerAgent ,changePassword,loginAgent , registerCustomer ,getAgentProfile};

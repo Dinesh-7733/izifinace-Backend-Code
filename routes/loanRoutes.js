@@ -15,7 +15,7 @@ router.post("/issue", protect, loanController.issueLoan);
 router.post("/outstanding/loan-details",borrowerProtect ,loanController.getActiveLoansByPhone);
 
 // Track loan repayments
-router.post("/repay", loanController.trackRepayment);
+router.post("/repay",borrowerProtect,loanController.trackRepayment);
 
 router.get("/fully-paid",protect, loanController.getFullyPaidLoans);
 
@@ -39,4 +39,6 @@ router.get("/loan-requests",protect,authorizeRoles("lender"),loanController.getA
 
 router.post("/review-loan",protect,authorizeRoles("lender"),loanController.reviewLoanRequest);
 
+
+router.get("/active-loans",protect,authorizeRoles("agent"),loanController.getActiveLoansByAgent);
 module.exports = router; // Export the router

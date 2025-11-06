@@ -2,7 +2,7 @@ const express = require("express");
 const router = express.Router();
 
 
-const { registerAgent, changePassword, loginAgent, registerCustomer } = require("../controllers/agentController");
+const { registerAgent, changePassword, loginAgent, registerCustomer, getAgentProfile } = require("../controllers/agentController");
 const { protect, agentProtect } = require("../middleware/authMiddleware");
 const authorizeRoles = require("../middleware/rolemiddleware");
 const upload = require("../utils/upload");
@@ -16,7 +16,7 @@ registerAgent);
 router.post("/login",validateKenyaPhone,loginAgent);
 
 // Change password (agent only, must be logged in)
-router.put("/change-password", agentProtect, changePassword);
+router.put("/change-password", protect, changePassword);
 
 
 router.post(
@@ -31,5 +31,5 @@ router.post(
   registerCustomer
 );
 
-
+router.get("/profile",protect,getAgentProfile)
 module.exports = router;

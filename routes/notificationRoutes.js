@@ -16,7 +16,8 @@ router.delete("/:id",protect, notificationController.softDeleteNotification);
 
 router.get("/borrower", borrowerProtect, notificationController.getBorrowerNotifications);
 
-router.put("/borrower/:id/read", borrowerProtect,  notificationController.markBorrowerNotificationAsRead);
+router.put("/borrower/read", borrowerProtect,  notificationController.markBorrowerNotificationAsRead);
 
 router.delete("/borrower/:id", borrowerProtect, notificationController.deleteBorrowerNotification);
+
 module.exports = router;

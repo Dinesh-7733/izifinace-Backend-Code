@@ -19,7 +19,7 @@ exports.sendVerificationCode = async (phone) => {
     const otp = generateOTP();
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
 
-    await OTP.findOneAndUpdate(
+    await OTP.findOneAndUpdate( 
       { phone },
       { otp, expiresAt },
       { upsert: true, new: true }
