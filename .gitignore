@@ -1,5 +1,49 @@
+# ===============================
+# Node
+# ===============================
 node_modules/
+yarn.lock
+package-lock.json
 
-"config/*.json" 
-"config/travelpay-backend-firebase-adminsdk-*.json" 
-"config/travelpay-backend-firebase-adminsdk-*.json" 
+# ===============================
+# Environment & Secrets
+# ===============================
+.env
+*.pem
+*.crt
+*.key
+*.txt
+
+fb_key.txt
+firebase_private_key.pem
+
+# ===============================
+# Firebase secrets
+# ===============================
+serviceAccountKey.json
+secret.local.js
+
+functions/serviceAccountKey.json
+functions/secret.local.js
+
+# ===============================
+# Config JSONs
+# ===============================
+config/*.json
+config/travelpay-backend-firebase-adminsdk-*.json
+
+functions/config/*.json
+
+# ===============================
+# Firebase folders
+# ===============================
+firebase/
+functions/node_modules/
+
+# ===============================
+# Misc / temp folders
+# ===============================
+cls/
+git/
+main/
+scripts/
